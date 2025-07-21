@@ -1,0 +1,15 @@
+
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure ITP Checker",
+        "description": "Enter VIN to monitor ITP",
+        "data": {
+          "vin": "Vehicle VIN",
+          "name": "Sensor Name"
+        }
+      }
+    }
+  }
+}
