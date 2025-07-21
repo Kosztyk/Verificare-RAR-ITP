@@ -1,0 +1,11 @@
+{
+  "domain": "rar_itp_checker",
+  "name": "RAR ITP Checker",
+  "version": "1.0.0",
+  "documentation": "https://prog.rarom.ro/rarpol/rarpol.asp",
+  "requirements": ["aiohttp>=3.7.4", "beautifulsoup4>=4.9.3"],
+  "dependencies": [],
+  "codeowners": ["kosztyk"],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
