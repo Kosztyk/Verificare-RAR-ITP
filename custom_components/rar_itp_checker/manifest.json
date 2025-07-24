@@ -3,7 +3,7 @@
   "name": "RAR ITP Checker",
   "version": "1.0.0",
   "documentation": "https://prog.rarom.ro/rarpol/rarpol.asp",
-  "requirements": ["aiohttp>=3.7.4", "beautifulsoup4>=4.9.3"],
+  "requirements": ["aiohttp>=3.7.4", "beautifulsoup4>=4.9.3", "pillow>=8.1.0", "pytesseract>=0.3.8"],
   "dependencies": [],
   "codeowners": ["kosztyk"],
   "iot_class": "cloud_polling",

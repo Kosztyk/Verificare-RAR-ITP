@@ -34,152 +34,143 @@ MONTH_MAP = {
     "dec": "12",
 }
 
-
 class OCRAPIError(Exception):
     """Custom exception for OCR API errors"""
 
-
 async def solve_captcha_with_ocrspace(image_bytes: bytes, api_key: str = None) -> str:
-    """Solve CAPTCHA using OCR.Space API with improved error handling"""
+    """Solve CAPTCHA using OCR.Space API with improved timeout handling"""
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             form = aiohttp.FormData()
             form.add_field("file", image_bytes, filename="captcha.png")
-            form.add_field("apikey", api_key or "helloworld")
+            form.add_field("apikey", api_key or "helloworld")  # fallback to free tier
             form.add_field("language", "eng")
-            form.add_field("OCREngine", "2")
+            form.add_field("OCREngine", "2")  # Best for CAPTCHAs
+            form.add_field("isOverlayRequired", "false")
 
             try:
                 async with session.post(OCR_API_URL, data=form) as resp:
-                    # Handle non-JSON responses
-                    if "application/json" not in resp.content_type:
-                        text = await resp.text()
-                        _LOGGER.warning(
-                            "OCR API returned non-JSON: %s %s", resp.status, text[:100]
-                        )
-                        raise OCRAPIError("Non-JSON response from OCR API")
+                    if resp.status != 200:
+                        error_msg = f"OCR API returned status {resp.status}"
+                        _LOGGER.warning(error_msg)
+                        raise OCRAPIError(error_msg)
 
                     data = await resp.json()
-                    if resp.status != 200:
-                        error_msg = data.get("ErrorMessage", "Unknown error")
+                    if not data.get("ParsedResults"):
+                        error_msg = data.get("ErrorMessage", "No parsed results")
+                        if isinstance(error_msg, list):
+                            error_msg = ", ".join(error_msg)
                         _LOGGER.warning("OCR API error: %s", error_msg)
-                        raise OCRAPIError(f"OCR API error: {error_msg}")
+                        raise OCRAPIError(f"OCR failed: {error_msg}")
 
-                    result = data.get("ParsedResults", [{}])[0].get("ParsedText", "").strip()
-                    # Validate it's a 4-6 digit code
-                    if result and re.match(r"^\d{4,6}$", result):
-                        return result
-                    raise OCRAPIError("Invalid CAPTCHA format")
+                    result = data["ParsedResults"][0].get("ParsedText", "").strip()
+                    if not re.match(r"^\d{4,6}$", result):  # Validate CAPTCHA format
+                        raise OCRAPIError(f"Invalid CAPTCHA format: {result}")
+                    
+                    return result
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                _LOGGER.warning("OCR API request failed: %s", str(e))
-                raise OCRAPIError("API request failed") from e
+            except asyncio.TimeoutError:
+                _LOGGER.warning("OCR API timeout, retrying with longer timeout")
+                # Retry with longer timeout
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as retry_session:
+                    async with retry_session.post(OCR_API_URL, data=form) as resp:
+                        data = await resp.json()
+                        if not data.get("ParsedResults"):
+                            raise OCRAPIError("OCR failed after retry")
+                        return data["ParsedResults"][0].get("ParsedText", "").strip()
 
     except Exception as e:
         _LOGGER.warning("OCR processing failed: %s", str(e))
         raise OCRAPIError("OCR processing failed") from e
 
-
 async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
-    """Fetch ITP data from RAR site with improved error handling."""
-    timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
+    """Fetch ITP data from RAR site with robust CAPTCHA handling."""
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (HA RAR ITP Checker)",
+        "Referer": BASE_URL,
+        "Origin": "https://prog.rarom.ro"
+    }
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         try:
             _LOGGER.info("Starting ITP check for VIN: %s", vin)
 
-            # Retry loop for CAPTCHA
+            # Initial page load
+            async with session.get(BASE_URL) as response:
+                if response.status != 200:
+                    raise UpdateFailed(f"Initial request failed: HTTP {response.status}")
+                html = await response.text()
+
+            soup = BeautifulSoup(html, "html.parser")
+            
+            # CAPTCHA handling with retries
             for attempt in range(3):
                 try:
-                    # Initial GET with timeout
-                    try:
-                        async with session.get(BASE_URL) as response:
-                            html = await response.text()
-                    except asyncio.TimeoutError:
-                        raise UpdateFailed("Timeout connecting to RAR website")
-
-                    soup = BeautifulSoup(html, "html.parser")
+                    # Locate CAPTCHA image
                     captcha_img = soup.find("img", id="imgVerf")
                     if not captcha_img or not captcha_img.get("src"):
-                        raise ValueError("CAPTCHA image not found")
+                        _LOGGER.debug("CAPTCHA HTML: %s", str(captcha_img))
+                        raise UpdateFailed("CAPTCHA image not found in page")
 
-                    # Download CAPTCHA with timeout
-                    try:
-                        captcha_url = f"https://prog.rarom.ro/rarpol/{captcha_img['src']}"
-                        async with session.get(
-                            captcha_url, headers={"Referer": BASE_URL}
-                        ) as cap_rsp:
-                            captcha_content = await cap_rsp.read()
-                    except asyncio.TimeoutError:
-                        raise UpdateFailed("Timeout downloading CAPTCHA image")
+                    # Build CAPTCHA URL
+                    captcha_src = captcha_img['src']
+                    if captcha_src.startswith("http"):
+                        captcha_url = captcha_src
+                    else:
+                        captcha_url = f"https://prog.rarom.ro/rarpol/{captcha_src.lstrip('/')}"
+                    
+                    _LOGGER.debug("Downloading CAPTCHA from: %s", captcha_url)
+                    
+                    # Download CAPTCHA image
+                    async with session.get(captcha_url) as cap_resp:
+                        if cap_resp.status != 200:
+                            raise UpdateFailed(f"CAPTCHA download failed: HTTP {cap_resp.status}")
+                        captcha_content = await cap_resp.read()
 
+                    # Solve CAPTCHA with retry logic
                     try:
-                        captcha_text = await solve_captcha_with_ocrspace(
-                            captcha_content, ocr_api_key
-                        )
+                        captcha_text = await solve_captcha_with_ocrspace(captcha_content, ocr_api_key)
                     except OCRAPIError as e:
-                        _LOGGER.warning("CAPTCHA solving failed: %s", str(e))
                         if attempt == 2:  # Last attempt
-                            raise UpdateFailed("Failed to solve CAPTCHA after 3 attempts")
+                            raise
+                        await asyncio.sleep(2)
                         continue
 
-                    clean_captcha = re.sub(r"\D", "", captcha_text)
+                    clean_captcha = re.sub(r"\D", "", captcha_text)  # Keep only digits
+                    _LOGGER.debug("CAPTCHA solved: %s", clean_captcha)
+
+                    # Prepare form data
                     form_data = {
                         "serie_civ": "",
                         "nr_id": vin.upper(),
-                        "verif_cod": clean_captcha,
+                        "antirobot": clean_captcha,
                         "trimite": "Caută",
                         "from_url": "",
                         "id": "",
                     }
-                    headers = {
-                        "Referer": BASE_URL,
-                        "Origin": "https://prog.rarom.ro",
-                        "User-Agent": "Mozilla/5.0 (HA RAR ITP Checker)",
-                    }
 
-                    _LOGGER.debug(
-                        "Form data being submitted: %s",
-                        {k: v for k, v in form_data.items() if k != "verif_cod"},
-                    )
+                    # Submit form
+                    async with session.post(BASE_URL, data=form_data) as result_response:
+                        result_text = await result_response.text()
+                        
+                        if "codul de verificare a fost copiat incorect" in result_text.lower():
+                            raise UpdateFailed("CAPTCHA validation failed")
+                        
+                        # Success - proceed to parse results
+                        break
 
-                    # Submit form with timeout
-                    try:
-                        async with session.post(
-                            BASE_URL, data=form_data, headers=headers
-                        ) as result_response:
-                            result_text = await result_response.text()
-                            _LOGGER.debug(
-                                "Response status: %s, content-type: %s",
-                                result_response.status,
-                                result_response.content_type,
-                            )
-                    except asyncio.TimeoutError:
-                        raise UpdateFailed("Timeout submitting form to RAR website")
-
-                    # Check if CAPTCHA was accepted
-                    if "codul de verificare a fost copiat incorect" in result_text.lower():
-                        if attempt == 2:  # Last attempt
-                            raise UpdateFailed("CAPTCHA validation failed after 3 attempts")
-                        continue  # Try again
-
-                    break  # Success - proceed with parsing
-
-                except UpdateFailed as uf:
+                except (UpdateFailed, OCRAPIError) as e:
                     if attempt == 2:  # Last attempt
-                        raise
-                    _LOGGER.debug("Attempt %d failed, retrying: %s", attempt + 1, uf)
-                    await asyncio.sleep(2)  # Add delay between retries
+                        raise UpdateFailed(f"Failed after 3 attempts: {str(e)}")
+                    _LOGGER.debug("Attempt %d failed, retrying: %s", attempt + 1, e)
+                    await asyncio.sleep(2)
                     continue
 
-            # Parse only the result container if available
+            # Parse results
             result_soup = BeautifulSoup(result_text, "html.parser")
             result_div = result_soup.find("div", id="rezbgcolor")
-            content_text = (
-                result_div.get_text(separator="\n", strip=True)
-                if result_div
-                else result_text
-            )
+            content_text = result_div.get_text(separator="\n", strip=True) if result_div else result_text
             lower = content_text.lower()
 
             # Default values
@@ -195,10 +186,9 @@ async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
                         raw_date = fragment.split()[0].strip().strip(".")
                         day, month, year = raw_date.split("-")
                         expiration_date = f"{year}-{MONTH_MAP.get(month, '01')}-{day.zfill(2)}"
-                        _LOGGER.debug("Parsed expiration_date: %s", expiration_date)
                     except Exception as e:
                         _LOGGER.warning("Failed to parse expiration date: %s", e)
-                # Fallback old format parsing: 'Data expirării'
+                # Fallback old format parsing
                 elif "data expirării" in lower:
                     try:
                         node = result_soup.find(text=lambda t: "Data expirării" in t)
@@ -206,7 +196,6 @@ async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
                             raw = node.find_next().get_text(strip=True)
                             day, month, year = raw.split(".")
                             expiration_date = f"{year}-{month}-{day}"
-                            _LOGGER.debug("Parsed old-format expiration_date: %s", expiration_date)
                     except Exception as e:
                         _LOGGER.warning("Failed to parse old-format date: %s", e)
 
@@ -217,13 +206,9 @@ async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
                 "last_checked": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-        except UpdateFailed as uf:
-            _LOGGER.error("ITP check failed for %s: %s", vin, uf)
-            raise
         except Exception as err:
-            _LOGGER.error("ITP check error for %s: %s", vin, err)
-            raise UpdateFailed(f"ITP check failed: {err}")
-
+            _LOGGER.error("ITP check failed for %s: %s", vin, err, exc_info=True)
+            raise UpdateFailed(f"ITP check failed: {err}") from err
 
 def calculate_days_until(expiration_date: str) -> int | None:
     """Calculate days until expiration."""
@@ -234,7 +219,6 @@ def calculate_days_until(expiration_date: str) -> int | None:
         return (exp - date.today()).days
     except ValueError:
         return None
-
 
 class ITPStatusSensor(CoordinatorEntity, SensorEntity):
     """ITP status sensor."""
@@ -261,7 +245,6 @@ class ITPStatusSensor(CoordinatorEntity, SensorEntity):
             "last_checked": self.coordinator.data.get("last_checked"),
         }
 
-
 class ITPExpirationDateSensor(CoordinatorEntity, SensorEntity):
     """ITP expiration date sensor."""
 
@@ -281,7 +264,6 @@ class ITPExpirationDateSensor(CoordinatorEntity, SensorEntity):
         """Return the state of the sensor."""
         return self.coordinator.data.get("expiration_date", "Unknown")
 
-
 class ITPLastCheckedSensor(CoordinatorEntity, SensorEntity):
     """Last checked timestamp sensor."""
 
@@ -300,7 +282,6 @@ class ITPLastCheckedSensor(CoordinatorEntity, SensorEntity):
     def state(self):
         """Return the state of the sensor."""
         return self.coordinator.data.get("last_checked")
-
 
 class ITPDaysLeftSensor(CoordinatorEntity, SensorEntity):
     """Days left until ITP expiration."""
@@ -323,7 +304,6 @@ class ITPDaysLeftSensor(CoordinatorEntity, SensorEntity):
         exp_date = self.coordinator.data.get("expiration_date")
         return calculate_days_until(exp_date)
 
-
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up sensors from config entry with improved error handling."""
     vin = config_entry.data["vin"]
@@ -338,7 +318,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 if attempt == 2:  # Last attempt
                     raise
                 _LOGGER.debug("Attempt %d failed, retrying: %s", attempt + 1, e)
-                await asyncio.sleep(2)  # Add delay between retries
+                await asyncio.sleep(2)
                 continue
 
     coordinator = DataUpdateCoordinator(
