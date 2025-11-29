@@ -15,4 +15,18 @@ Pentru a obtine API Key pentru OCR.Space urmatorii pasi trebuiesc urmati:
 🔹 Step 3: Check your inbox and confirm the details
 🔹 Step 4: Check your inbox for the free API key (subject: "Your OCR.Space API Key")
 
+## De unde descarc fisierele
+
+Ai doua optiuni pentru a instala integrarea:
+
+1. **Prin HACS (recomandat)**
+   - Deschide HACS → _Integrations_ → _Custom repositories_.
+   - Adauga URL-ul acestui depozit GitHub (`https://github.com/mariusmotea/Verificare-RAR-ITP`) ca _Integration_ si apoi instaleaza pachetul.
+   - Reporneste Home Assistant dupa instalare.
+
+2. **Instalare manuala**
+   - Descarca arhiva ZIP a ultimei versiuni din sectiunea **Releases** a acestui depozit GitHub: [https://github.com/mariusmotea/Verificare-RAR-ITP/releases](https://github.com/mariusmotea/Verificare-RAR-ITP/releases).
+   - Dupa descarcare, extrage arhiva si copiaza folderul `custom_components/rar_itp_checker` in directorul `config/custom_components` din instanta ta Home Assistant (creeaza structura daca nu exista).
+   - Reporneste Home Assistant pentru a incarca integrarea.
+
 

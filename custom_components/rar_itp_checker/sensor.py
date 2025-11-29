@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.util import slugify
+from .captcha_solver import solve_captcha_image
 from .const import DOMAIN, BASE_URL, DEFAULT_SCAN_INTERVAL, OCR_API_URL
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,51 +97,60 @@ async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
         try:
             _LOGGER.info("Starting ITP check for VIN: %s", vin)
 
-            # Initial page load
-            async with session.get(BASE_URL) as response:
-                if response.status != 200:
-                    raise UpdateFailed(f"Initial request failed: HTTP {response.status}")
-                html = await response.text()
+            result_text = ""
 
-            soup = BeautifulSoup(html, "html.parser")
-            
             # CAPTCHA handling with retries
             for attempt in range(3):
                 try:
-                    # Locate CAPTCHA image
+                    async with session.get(BASE_URL) as response:
+                        if response.status != 200:
+                            raise UpdateFailed(
+                                f"Initial request failed: HTTP {response.status}"
+                            )
+                        html = await response.text()
+
+                    soup = BeautifulSoup(html, "html.parser")
+
                     captcha_img = soup.find("img", id="imgVerf")
                     if not captcha_img or not captcha_img.get("src"):
                         _LOGGER.debug("CAPTCHA HTML: %s", str(captcha_img))
                         raise UpdateFailed("CAPTCHA image not found in page")
 
-                    # Build CAPTCHA URL
-                    captcha_src = captcha_img['src']
+                    captcha_src = captcha_img["src"]
                     if captcha_src.startswith("http"):
                         captcha_url = captcha_src
                     else:
                         captcha_url = f"https://prog.rarom.ro/rarpol/{captcha_src.lstrip('/')}"
-                    
+
                     _LOGGER.debug("Downloading CAPTCHA from: %s", captcha_url)
-                    
-                    # Download CAPTCHA image
                     async with session.get(captcha_url) as cap_resp:
                         if cap_resp.status != 200:
-                            raise UpdateFailed(f"CAPTCHA download failed: HTTP {cap_resp.status}")
+                            raise UpdateFailed(
+                                f"CAPTCHA download failed: HTTP {cap_resp.status}"
+                            )
                         captcha_content = await cap_resp.read()
 
-                    # Solve CAPTCHA with retry logic
+                    captcha_text = None
                     try:
-                        captcha_text = await solve_captcha_with_ocrspace(captcha_content, ocr_api_key)
-                    except OCRAPIError as e:
-                        if attempt == 2:  # Last attempt
-                            raise
-                        await asyncio.sleep(2)
-                        continue
+                        captcha_text = await solve_captcha_with_ocrspace(
+                            captcha_content, ocr_api_key
+                        )
+                    except OCRAPIError as err:
+                        _LOGGER.debug(
+                            "OCR.Space failed, falling back to local Tesseract: %s", err
+                        )
 
-                    clean_captcha = re.sub(r"\D", "", captcha_text)  # Keep only digits
+                    if not captcha_text:
+                        captcha_text = await solve_captcha_image(captcha_content)
+
+                    clean_captcha = re.sub(r"\D", "", captcha_text)
+                    if not re.fullmatch(r"\d{4,6}", clean_captcha):
+                        raise UpdateFailed(
+                            f"Invalid CAPTCHA output after cleaning: {clean_captcha}"
+                        )
+
                     _LOGGER.debug("CAPTCHA solved: %s", clean_captcha)
 
-                    # Prepare form data
                     form_data = {
                         "serie_civ": "",
                         "nr_id": vin.upper(),
@@ -150,18 +160,16 @@ async def fetch_itp(vin: str, ocr_api_key: str = None) -> dict:
                         "id": "",
                     }
 
-                    # Submit form
                     async with session.post(BASE_URL, data=form_data) as result_response:
                         result_text = await result_response.text()
-                        
+
                         if "codul de verificare a fost copiat incorect" in result_text.lower():
                             raise UpdateFailed("CAPTCHA validation failed")
-                        
-                        # Success - proceed to parse results
+
                         break
 
                 except (UpdateFailed, OCRAPIError) as e:
-                    if attempt == 2:  # Last attempt
+                    if attempt == 2:
                         raise UpdateFailed(f"Failed after 3 attempts: {str(e)}")
                     _LOGGER.debug("Attempt %d failed, retrying: %s", attempt + 1, e)
                     await asyncio.sleep(2)
